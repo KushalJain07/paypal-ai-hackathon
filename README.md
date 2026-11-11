@@ -1,36 +1,19 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# PayPilot
 
-## Getting Started
+PayPilot is a PayPal Sandbox prototype for agent initiated payouts. Every queued payout stays cancellable for five minutes. If it is not undone, the server submits it through PayPal's Sandbox Payouts API.
 
-First, run the development server:
+## Run locally
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
-```
+1. Copy `.env.example` to `.env.local`.
+2. Add your PayPal Sandbox REST app client ID and secret to `.env.local`.
+3. Set `PAYPAL_AUTOMATION_ENABLED=true` to allow Sandbox payouts. Keep it `false` to prevent queued payments from being submitted.
+4. Run `npm run dev` and open `http://localhost:3000`.
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Use Sandbox accounts and recipients only. The amount is capped at $500 USD per payout in this prototype.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Prototype limits
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
-
-## Learn More
-
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- The queue is held in the Node.js process memory. Restarting the server or using a serverless/multi-instance deployment can lose queued payments and timers. Use a durable database and a background job queue before deploying.
+- This prototype has no user authentication. The API accepts payment requests from any browser that can reach it. Automated payouts are blocked in production; add authentication, authorization, audit logs, and durable idempotent job processing before enabling production payments.
+- A payout accepted by PayPal may still be processing or later fail. Check the payout batch in the PayPal Sandbox dashboard for its final status.
+- Keep credentials in `.env.local` or your deployment secret store. Never put them in `NEXT_PUBLIC_*` variables or commit them.
