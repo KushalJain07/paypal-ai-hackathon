@@ -1,12 +1,12 @@
 import { randomBytes, randomUUID } from "node:crypto";
 
-export const UNDO_WINDOW_MS = 5 * 60 * 1000;
 export type PaymentStatus = "pending" | "sending" | "sent" | "failed" | "cancelled";
 export type Payment = {
   id: string;
   recipient: string;
   amount: string;
   note: string;
+  undoMinutes: number;
   status: PaymentStatus;
   createdAt: number;
   executeAt: number;
@@ -55,9 +55,11 @@ async function submitPayout(payment: StoredPayment) {
       },
       body: "grant_type=client_credentials",
     });
-    const auth = await authResponse.json();
+    const auth = await authResponse.json().catch(() => ({}));
     if (!authResponse.ok || typeof auth.access_token !== "string") {
-      throw new Error("PayPal Sandbox authentication failed. Check the server credentials and Payouts permissions.");
+      const code = typeof auth.error === "string" ? auth.error : "AUTHENTICATION_FAILED";
+      const description = typeof auth.error_description === "string" ? auth.error_description.replace(/[\r\n]+/g, " ").slice(0, 180) : "Check the Sandbox app credentials.";
+      throw new Error(`PayPal Sandbox authentication failed (${code}): ${description}`);
     }
 
     const payoutResponse = await fetch(`${baseUrl}/v1/payments/payouts`, {
@@ -82,10 +84,21 @@ async function submitPayout(payment: StoredPayment) {
         }],
       }),
     });
-    const result = await payoutResponse.json();
+    const result = await payoutResponse.json().catch(() => ({}));
     if (!payoutResponse.ok) {
-      const detail = Array.isArray(result.details) ? result.details[0]?.issue : undefined;
-      throw new Error(typeof detail === "string" ? `PayPal rejected this payout (${detail}).` : "PayPal Sandbox could not accept this payout.");
+      const detail = Array.isArray(result.details) ? result.details[0] : undefined;
+      const code = typeof detail?.issue === "string"
+        ? detail.issue
+        : typeof result.name === "string" ? result.name : `HTTP_${payoutResponse.status}`;
+      const message = typeof detail?.description === "string"
+        ? detail.description
+        : typeof result.message === "string" ? result.message : "Check that Payouts is enabled for this Sandbox app and that the sender account can make payouts.";
+      const safeMessage = message.replace(/[\r\n]+/g, " ").slice(0, 180);
+      const debugId = payoutResponse.headers.get("paypal-debug-id");
+      if (code === "PAYOUT_NOT_AVAILABLE" || /country.{0,50}not allowed to send this payout/i.test(safeMessage)) {
+        throw new Error(`PayPal Payouts cannot send from the country registered to this sender account. This is an account eligibility restriction; use a payout method supported for your business location.${debugId ? ` [debug ${debugId}]` : ""}`);
+      }
+      throw new Error(`PayPal Sandbox rejected payout (${code}): ${safeMessage}${debugId ? ` [debug ${debugId}]` : ""}`);
     }
     payment.batchId = result.batch_header?.payout_batch_id;
     payment.status = "sent";
@@ -95,16 +108,17 @@ async function submitPayout(payment: StoredPayment) {
   }
 }
 
-export function schedulePayment(input: { recipient: string; amount: string; note: string }) {
+export function schedulePayment(input: { recipient: string; amount: string; note: string; undoMinutes: number }) {
   const createdAt = Date.now();
+  const undoWindowMs = input.undoMinutes * 60 * 1000;
   const payment: StoredPayment = {
     id: randomUUID(),
     ...input,
     status: "pending",
     createdAt,
-    executeAt: createdAt + UNDO_WINDOW_MS,
+    executeAt: createdAt + undoWindowMs,
   };
-  payment.timer = setTimeout(() => void submitPayout(payment), UNDO_WINDOW_MS);
+  payment.timer = setTimeout(() => void submitPayout(payment), undoWindowMs);
   store.payments.set(payment.id, payment);
   return publicPayment(payment);
 }

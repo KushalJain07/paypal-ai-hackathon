@@ -24,7 +24,7 @@ export async function POST(request: Request) {
     return Response.json({ error: "Send a valid payment request." }, { status: 400 });
   }
 
-  const { recipient, amount, note } = body as Record<string, unknown>;
+  const { recipient, amount, note, undoMinutes } = body as Record<string, unknown>;
   const email = typeof recipient === "string" ? recipient.trim() : "";
   const rawAmount = typeof amount === "string" || typeof amount === "number" ? String(amount).trim() : "";
   const numericAmount = Number(rawAmount);
@@ -38,7 +38,11 @@ export async function POST(request: Request) {
   if (paymentNote.length > 120) {
     return Response.json({ error: "Payment notes must be 120 characters or fewer." }, { status: 400 });
   }
+  const minutes = Number(undoMinutes);
+  if (!Number.isInteger(minutes) || minutes < 1 || minutes > 60) {
+    return Response.json({ error: "Choose an undo window from 1 to 60 whole minutes." }, { status: 400 });
+  }
 
-  const payment = schedulePayment({ recipient: email, amount: numericAmount.toFixed(2), note: paymentNote });
+  const payment = schedulePayment({ recipient: email, amount: numericAmount.toFixed(2), note: paymentNote, undoMinutes: minutes });
   return Response.json({ payment }, { status: 201 });
 }
