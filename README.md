@@ -1,6 +1,6 @@
 # PayPilot
 
-PayPilot is a PayPal Sandbox prototype for agent initiated payouts. Every queued payout stays cancellable for five minutes. If it is not undone, the server submits it through PayPal's Sandbox Payouts API.
+PayPilot is a PayPal Sandbox prototype for agent initiated payouts. Choose a 1 to 60 minute undo window for each payout. If it is not undone, the server submits it through PayPal's Sandbox Payouts API.
 
 ## Run locally
 
@@ -16,4 +16,6 @@ Use Sandbox accounts and recipients only. The amount is capped at $500 USD per p
 - The queue is held in the Node.js process memory. Restarting the server or using a serverless/multi-instance deployment can lose queued payments and timers. Use a durable database and a background job queue before deploying.
 - This prototype has no user authentication. The API accepts payment requests from any browser that can reach it. Automated payouts are blocked in production; add authentication, authorization, audit logs, and durable idempotent job processing before enabling production payments.
 - A payout accepted by PayPal may still be processing or later fail. Check the payout batch in the PayPal Sandbox dashboard for its final status.
+- PayPal API errors are shown on the failed queue item. Payouts also require the Payouts capability for the REST app and a suitable Sandbox sender account; see [PayPal Payouts troubleshooting](https://developer.paypal.com/payouts/troubleshooting/).
+- PayPal also restricts which countries can send Payouts. Check [supported countries and features](https://developer.paypal.com/payouts/supported-features/) before enabling this flow for an account.
 - Keep credentials in `.env.local` or your deployment secret store. Never put them in `NEXT_PUBLIC_*` variables or commit them.
