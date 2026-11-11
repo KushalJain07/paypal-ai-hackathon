@@ -7,7 +7,7 @@ async function main(): Promise<void> {
         {
           role: "user",
           content:
-            "Create a PayPal order for $50 USD for Premium News service.",
+            "Create a PayPal order for 50 USD for Premium News service.",
         },
       ],
     });
