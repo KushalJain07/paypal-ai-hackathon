@@ -121,6 +121,10 @@ async function runRefundFlow(
     input.paymentId,
     authorization.authorizationId,
   );
+  if (capture.status === "PENDING") {
+    console.log("Refund flow: capture is PENDING; refund is not submitted yet.");
+    return;
+  }
   if (capture.status !== "COMPLETED") {
     throw new PayPalProviderError("CAPTURE_NOT_COMPLETED", "smokeTest");
   }

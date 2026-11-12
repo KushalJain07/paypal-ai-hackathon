@@ -13,8 +13,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "PayPilot — Agent Payment Controls",
-  description: "Review agent payments and undo them before they are sent.",
+  title: "REWIND — Agent Payment Safety",
+  description: "Agents propose payments. REWIND verifies them and preserves an undo window.",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {

@@ -21,6 +21,9 @@ const amountSchema = z
     value: z.string().min(1).max(32),
   })
   .passthrough();
+const captureAmountSchema = amountSchema.extend({
+  value: z.string().regex(/^\d+(?:\.\d{1,2})?$/),
+});
 
 const linkSchema = z
   .object({ href: z.string().url(), rel: z.string().min(1) })
@@ -52,7 +55,8 @@ const captureResponseSchema = z
       "PARTIALLY_REFUNDED",
       "REFUNDED",
     ]),
-    amount: amountSchema,
+    amount: captureAmountSchema,
+    final_capture: z.boolean().optional(),
   })
   .passthrough();
 
@@ -102,6 +106,10 @@ const orderResponseSchema = z
   })
   .passthrough();
 
+const createOrderResponseSchema = orderResponseSchema.omit({
+  purchase_units: true,
+});
+
 const oauthResponseSchema = z
   .object({
     access_token: z.string().min(1),
@@ -137,6 +145,7 @@ type Operation =
   | "authorizeOrder"
   | "getAuthorization"
   | "captureAuthorization"
+  | "getCapture"
   | "voidAuthorization"
   | "refundCapture";
 
@@ -298,7 +307,7 @@ export class SandboxPaymentProvider implements PaymentProvider {
       validated.data.paymentId,
       "/v2/checkout/orders",
       "POST",
-      orderResponseSchema,
+      createOrderResponseSchema,
       {
         intent: "AUTHORIZE",
         purchase_units: [
@@ -342,6 +351,30 @@ export class SandboxPaymentProvider implements PaymentProvider {
     };
   }
 
+  async findCaptureForAuthorization(
+    paymentId: string,
+    orderId: string,
+    authorizationId: string,
+  ): Promise<Capture | null> {
+    const order = await this.request(
+      "getOrder",
+      paymentId,
+      `/v2/checkout/orders/${encodeIdentifier(orderId, "getOrder")}`,
+      "GET",
+      orderResponseSchema,
+    );
+    const matchingUnit = order.purchase_units.find((unit) =>
+      unit.payments?.authorizations?.some(
+        (authorization) => authorization.id === authorizationId,
+      )
+    );
+    if (!matchingUnit) {
+      return null;
+    }
+    const captureId = matchingUnit.payments?.captures?.at(-1)?.id;
+    return captureId ? this.getCapture(paymentId, captureId) : null;
+  }
+
   async authorizeOrder(
     paymentId: string,
     orderId: string,
@@ -379,13 +412,42 @@ export class SandboxPaymentProvider implements PaymentProvider {
     paymentId: string,
     authorizationId: string,
   ): Promise<Capture> {
+    const path = `/v2/payments/authorizations/${encodeIdentifier(authorizationId, "captureAuthorization")}/capture`;
+    let response: unknown;
+    try {
+      response = await this.request(
+        "captureAuthorization",
+        paymentId,
+        path,
+        "POST",
+        z.unknown(),
+        { final_capture: true },
+      );
+    } catch (error) {
+      if (!this.isAmbiguousCaptureError(error)) {
+        throw error;
+      }
+      return this.recoverCapture(paymentId, authorizationId, undefined, true);
+    }
+
+    const parsed = captureResponseSchema.safeParse(response);
+    if (parsed.success) {
+      try {
+        return this.normalizeCapture(parsed.data);
+      } catch {
+        return this.recoverCapture(paymentId, authorizationId, response, true);
+      }
+    }
+    return this.recoverCapture(paymentId, authorizationId, response, true);
+  }
+
+  async getCapture(paymentId: string, captureId: string): Promise<Capture> {
     const capture = await this.request(
-      "captureAuthorization",
+      "getCapture",
       paymentId,
-      `/v2/payments/authorizations/${encodeIdentifier(authorizationId, "captureAuthorization")}/capture`,
-      "POST",
+      `/v2/payments/captures/${encodeIdentifier(captureId, "getCapture")}`,
+      "GET",
       captureResponseSchema,
-      { final_capture: true },
     );
     return this.normalizeCapture(capture);
   }
@@ -440,7 +502,105 @@ export class SandboxPaymentProvider implements PaymentProvider {
       status: capture.status,
       amountCents,
       currency,
+      finalCapture: capture.final_capture ?? null,
     };
+  }
+
+  private isAmbiguousCaptureError(error: unknown): boolean {
+    return error instanceof PayPalProviderError &&
+      error.operation === "captureAuthorization" &&
+      (error.code === "NETWORK_ERROR" ||
+        error.code === "RESPONSE_SCHEMA_INVALID" ||
+        (error.httpStatus !== undefined && error.httpStatus >= 500));
+  }
+
+  private async recoverCapture(
+    paymentId: string,
+    authorizationId: string,
+    response: unknown,
+    mayRetry: boolean,
+  ): Promise<Capture> {
+    const captureId = z.object({ id: z.string().min(1) })
+      .passthrough()
+      .safeParse(response).data?.id;
+    let captureLookupError: unknown;
+    if (captureId) {
+      try {
+        return await this.getCapture(paymentId, captureId);
+      } catch (error) {
+        captureLookupError = error;
+      }
+    }
+
+    let authorization: Authorization;
+    try {
+      authorization = await this.getAuthorization(paymentId, authorizationId);
+    } catch {
+      throw new PayPalProviderError(
+        "CAPTURE_RECOVERY_PENDING",
+        "captureAuthorization",
+      );
+    }
+    if (authorization.status === "CAPTURED" ||
+      authorization.status === "PARTIALLY_CAPTURED") {
+      throw new PayPalProviderError(
+        "CAPTURE_RECOVERY_PENDING",
+        "captureAuthorization",
+      );
+    }
+    if (mayRetry &&
+      (authorization.status === "CREATED" ||
+        authorization.status === "PENDING")) {
+      let retryResponse: unknown;
+      try {
+        retryResponse = await this.request(
+          "captureAuthorization",
+          paymentId,
+          `/v2/payments/authorizations/${encodeIdentifier(authorizationId, "captureAuthorization")}/capture`,
+          "POST",
+          z.unknown(),
+          { final_capture: true },
+        );
+      } catch (error) {
+        if (this.isAmbiguousCaptureError(error)) {
+          throw new PayPalProviderError(
+            "CAPTURE_RECOVERY_PENDING",
+            "captureAuthorization",
+          );
+        }
+        throw error;
+      }
+      const retryParsed = captureResponseSchema.safeParse(retryResponse);
+      if (retryParsed.success) {
+        try {
+          return this.normalizeCapture(retryParsed.data);
+        } catch {
+          return this.recoverCapture(
+            paymentId,
+            authorizationId,
+            retryResponse,
+            false,
+          );
+        }
+      }
+      return this.recoverCapture(
+        paymentId,
+        authorizationId,
+        retryResponse,
+        false,
+      );
+    }
+    if (captureLookupError instanceof PayPalProviderError &&
+      captureLookupError.code === "NETWORK_ERROR") {
+      throw new PayPalProviderError(
+        "CAPTURE_RECOVERY_PENDING",
+        "captureAuthorization",
+      );
+    }
+    throw new PayPalProviderError(
+      "RESPONSE_SCHEMA_INVALID",
+      "captureAuthorization",
+    );
   }
 
   private async request<T>(

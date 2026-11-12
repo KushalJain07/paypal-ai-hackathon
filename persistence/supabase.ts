@@ -214,22 +214,13 @@ function createSupabaseRepositories(
 
       update: async (mandate): Promise<Mandate> => {
         const validated = persistedMandateSchema.parse(mandate);
-        const { data, error } = await client
-          .from("mandates")
-          .update(validated)
-          .eq("id", validated.id)
-          .select("*")
-          .maybeSingle();
+        const { data, error } = await client.rpc("update_mandate", {
+          p_mandate: validated,
+        });
         if (error) {
           throw databaseError(error);
         }
-        if (!data) {
-          throw new PersistenceError(
-            "MANDATE_NOT_FOUND",
-            persistenceMessage("MANDATE_NOT_FOUND"),
-          );
-        }
-        return mandateFromRow(data);
+        return mandateFromRow(requireData(data?.[0] ?? null, "mandate update"));
       },
 
       getById: async (id): Promise<Mandate | null> => {
@@ -279,16 +270,13 @@ function createSupabaseRepositories(
       createRejected: async (
         input,
         reason,
-        detail,
+        decision,
+        createdAt,
       ): Promise<Payment> => {
         const request = reservePaymentInputSchema.parse(input);
         const safeReason = z.string().min(1).max(128).parse(reason);
-        const safeDetail = z.record(z.string(), z.union([
-          z.string(),
-          z.number().finite(),
-          z.boolean(),
-          z.null(),
-        ])).parse(detail);
+        const validatedDecision = decisionSchema.parse(decision);
+        const validatedAt = z.string().datetime({ offset: true }).parse(createdAt);
         const { data, error } = await client.rpc("create_rejected_payment", {
           p_id: request.id,
           p_mandate_id: request.mandate_id,
@@ -296,9 +284,9 @@ function createSupabaseRepositories(
           p_amount: request.amount,
           p_currency: request.currency,
           p_payee_email: request.payee_email,
-          p_created_at: request.created_at,
+          p_created_at: validatedAt,
           p_reason: safeReason,
-          p_detail: safeDetail,
+          p_decision: validatedDecision,
         });
         if (error) {
           throw databaseError(error);
@@ -389,6 +377,7 @@ function createSupabaseRepositories(
         action: PaymentAction,
         at,
         dueAt,
+        staleAfterSeconds = 120,
       ): Promise<boolean> => {
         const validatedId = repositoryIdSchema.parse(paymentId);
         const validatedStatus = paymentSchema.shape.status.parse(expectedStatus);
@@ -397,17 +386,52 @@ function createSupabaseRepositories(
         const validatedDueAt = dueAt === undefined
           ? null
           : z.string().datetime({ offset: true }).parse(dueAt);
-        const { data, error } = await client.rpc("claim_payment_action", {
+        const validatedStaleAfterSeconds = z.number().int().positive().max(86400)
+          .parse(staleAfterSeconds);
+        const { data, error } = await client.rpc("claim_payment_action_v2", {
           p_payment_id: validatedId,
           p_expected_status: validatedStatus,
           p_action: validatedAction,
           p_at: validatedAt,
           p_due_at: validatedDueAt,
+          p_stale_after_seconds: validatedStaleAfterSeconds,
         });
         if (error) {
           throw databaseError(error);
         }
         return data === true;
+      },
+
+      listStaleReleaseClaims: async (
+        before,
+      ): Promise<Array<{ payment: Payment; claimedAt: string }>> => {
+        const validatedBefore = z.string().datetime({ offset: true }).parse(before);
+        const { data, error } = await client.rpc("list_stale_release_claims", {
+          p_before: validatedBefore,
+        });
+        if (error) {
+          throw databaseError(error);
+        }
+        const claims = data ?? [];
+        if (claims.length === 0) {
+          return [];
+        }
+        const { data: paymentRows, error: paymentError } = await client
+          .from("payments")
+          .select("*")
+          .in("id", claims.map((claim) => claim.payment_id));
+        if (paymentError) {
+          throw databaseError(paymentError);
+        }
+        const paymentsById = new Map(
+          paymentRows.map((row) => [row.id, paymentFromRow(row)]),
+        );
+        return claims.flatMap((claim) => {
+          const payment = paymentsById.get(claim.payment_id);
+          return payment
+            ? [{ payment, claimedAt: claim.claimed_at }]
+            : [];
+        });
       },
 
       clearActionClaim: async (

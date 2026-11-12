@@ -71,6 +71,32 @@ function authorizationResponse(status = "CREATED"): object {
   };
 }
 
+function captureResponse(
+  status = "COMPLETED",
+  id = "CAPTURE-123",
+): object {
+  return {
+    id,
+    status,
+    amount: { currency_code: "USD", value: "12.34" },
+    final_capture: true,
+    seller_protection: { status: "ELIGIBLE", dispute_categories: ["ITEM_NOT_RECEIVED"] },
+    seller_receivable_breakdown: {
+      gross_amount: { currency_code: "USD", value: "12.34" },
+      paypal_fee: { currency_code: "USD", value: "0.65" },
+      net_amount: { currency_code: "USD", value: "11.69" },
+    },
+    invoice_id: "invoice-123",
+    links: [
+      {
+        href: "https://api-m.sandbox.paypal.com/v2/payments/captures/CAPTURE-123",
+        rel: "self",
+        method: "GET",
+      },
+    ],
+  };
+}
+
 describe("PayPal Sandbox payment provider", () => {
   it("creates AUTHORIZE orders and normalizes Guardian data", async () => {
     const calls: Array<{ url: string; init?: RequestInit }> = [];
@@ -110,6 +136,39 @@ describe("PayPal Sandbox payment provider", () => {
         },
       ],
     });
+  });
+
+  it("accepts a create response that omits purchase units", async () => {
+    const provider = makeProvider(async (input) => {
+      if (String(input).endsWith("/v1/oauth2/token")) {
+        return tokenResponse();
+      }
+      return response({
+        id: orderId,
+        status: "CREATED",
+        links: [
+          {
+            href: "https://www.sandbox.paypal.com/checkoutnow?token=ORDER-123",
+            rel: "approve",
+          },
+        ],
+      });
+    });
+
+    const result = await provider.createOrder({
+      paymentId,
+      payeeEmail: "payee@example.com",
+      amountCents: 1234,
+      currency: "USD",
+      invoiceId: "invoice-123",
+    });
+
+    assert.equal(result.paypalOrderId, orderId);
+    assert.equal(result.status, "CREATED");
+    assert.equal(
+      result.approvalUrl,
+      "https://www.sandbox.paypal.com/checkoutnow?token=ORDER-123",
+    );
   });
 
   it("maps PayPal errors without exposing raw payload values", async () => {
@@ -249,16 +308,13 @@ describe("PayPal Sandbox payment provider", () => {
             },
           ],
         });
+
       }
       if (url.endsWith(`/authorizations/${authorizationId}`)) {
         return response(authorizationResponse());
       }
       if (url.endsWith(`/authorizations/${authorizationId}/capture`)) {
-        return response({
-          id: "CAPTURE-123",
-          status: "COMPLETED",
-          amount: { currency_code: "USD", value: "12.34" },
-        });
+        return response(captureResponse());
       }
       return response({ id: "REFUND-123", status: "COMPLETED" });
     });
@@ -281,11 +337,173 @@ describe("PayPal Sandbox payment provider", () => {
       status: "COMPLETED",
       amountCents: 1234,
       currency: "USD",
+      finalCapture: true,
     });
     assert.deepEqual(refund, {
       refundId: "REFUND-123",
       status: "COMPLETED",
     });
+  });
+
+  it("recovers a capture by reading the order and then the capture resource", async () => {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const staleOrder = {
+      ...orderResponse("COMPLETED", true),
+      purchase_units: [{
+        invoice_id: "invoice-123",
+        payee: { email_address: "payee@example.com" },
+        amount: { currency_code: "USD", value: "12.34" },
+        payments: {
+          authorizations: [{ id: authorizationId, status: "CAPTURED" }],
+          captures: [{ id: "CAPTURE-123", status: "COMPLETED" }],
+        },
+      }],
+    };
+    const provider = makeProvider(async (input, init) => {
+      const url = String(input);
+      calls.push({ url, init });
+      if (url.endsWith("/v1/oauth2/token")) {
+        return tokenResponse();
+      }
+      if (url.endsWith(`/v2/checkout/orders/${orderId}`)) {
+        return response(staleOrder);
+      }
+      return response(captureResponse());
+    });
+
+    const capture = await provider.findCaptureForAuthorization(
+      paymentId,
+      orderId,
+      authorizationId,
+    );
+
+    assert.deepEqual(capture, {
+      captureId: "CAPTURE-123",
+      status: "COMPLETED",
+      amountCents: 1234,
+      currency: "USD",
+      finalCapture: true,
+    });
+    const getOrderCall = calls.find((call) =>
+      call.url.endsWith(`/v2/checkout/orders/${orderId}`)
+    );
+    const getCaptureCall = calls.find((call) =>
+      call.url.endsWith("/v2/payments/captures/CAPTURE-123")
+    );
+    assert.ok(getOrderCall);
+    assert.ok(getCaptureCall);
+    assert.equal(
+      new Headers(getOrderCall.init?.headers).get("PayPal-Request-Id"),
+      derivePayPalRequestId(paymentId, "getOrder"),
+    );
+    assert.equal(
+      new Headers(getCaptureCall.init?.headers).get("PayPal-Request-Id"),
+      derivePayPalRequestId(paymentId, "getCapture"),
+    );
+  });
+
+  it("reports a PENDING capture without treating it as a failure", async () => {
+    const provider = makeProvider(async (input) =>
+      String(input).endsWith("/v1/oauth2/token")
+        ? tokenResponse()
+        : response(captureResponse("PENDING")),
+    );
+
+    const capture = await provider.captureAuthorization(
+      paymentId,
+      authorizationId,
+    );
+
+    assert.deepEqual(capture, {
+      captureId: "CAPTURE-123",
+      status: "PENDING",
+      amountCents: 1234,
+      currency: "USD",
+      finalCapture: true,
+    });
+  });
+
+  it("rejects malformed capture data and retries only with the same idempotency key", async () => {
+    const captureRequestIds: string[] = [];
+    const malformedCapture = {
+      id: "CAPTURE-123",
+      status: "COMPLETED",
+      amount: { currency_code: "USD", value: "not-an-amount" },
+      final_capture: true,
+    };
+    const provider = makeProvider(async (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/v1/oauth2/token")) {
+        return tokenResponse();
+      }
+      if (url.endsWith(`/authorizations/${authorizationId}/capture`)) {
+        captureRequestIds.push(
+          new Headers(init?.headers).get("PayPal-Request-Id") ?? "",
+        );
+        return response(malformedCapture);
+      }
+      if (url.endsWith(`/captures/CAPTURE-123`)) {
+        return response(malformedCapture);
+      }
+      if (url.endsWith(`/authorizations/${authorizationId}`)) {
+        return response(authorizationResponse("CREATED"));
+      }
+      throw new Error("Unexpected test request");
+    });
+
+    await assert.rejects(
+      provider.captureAuthorization(paymentId, authorizationId),
+      (error: unknown) =>
+        error instanceof PayPalProviderError &&
+        error.code === "RESPONSE_SCHEMA_INVALID",
+    );
+    assert.equal(captureRequestIds.length, 2);
+    assert.equal(captureRequestIds[0], captureRequestIds[1]);
+    assert.equal(
+      captureRequestIds[0],
+      derivePayPalRequestId(paymentId, "captureAuthorization"),
+    );
+  });
+
+  it("recovers a completed capture by GET when the POST payload is malformed", async () => {
+    const calls: string[] = [];
+    const provider = makeProvider(async (input) => {
+      const url = String(input);
+      calls.push(url);
+      if (url.endsWith("/v1/oauth2/token")) {
+        return tokenResponse();
+      }
+      if (url.endsWith(`/authorizations/${authorizationId}/capture`)) {
+        return response({
+          id: "CAPTURE-123",
+          status: "COMPLETED",
+          links: [
+            {
+              href: "https://api-m.sandbox.paypal.com/v2/payments/captures/CAPTURE-123",
+              rel: "self",
+              method: "GET",
+            },
+          ],
+        });
+      }
+      if (url.endsWith("/captures/CAPTURE-123")) {
+        return response(captureResponse());
+      }
+      throw new Error("Unexpected test request");
+    });
+
+    const capture = await provider.captureAuthorization(
+      paymentId,
+      authorizationId,
+    );
+
+    assert.equal(capture.captureId, "CAPTURE-123");
+    assert.equal(capture.status, "COMPLETED");
+    assert.equal(calls.some((url) => url.endsWith("/captures/CAPTURE-123")), true);
+    assert.equal(
+      calls.some((url) => url.endsWith(`/authorizations/${authorizationId}`)),
+      false,
+    );
   });
 });
 

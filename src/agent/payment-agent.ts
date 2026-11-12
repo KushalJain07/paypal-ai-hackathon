@@ -2,141 +2,165 @@ import { createAgent, tool } from "langchain";
 import { ChatOpenRouter } from "@langchain/openrouter";
 import { z } from "zod";
 
-import { env } from "../config/env";
-import { paypalClient } from "../paypal/paypal-client";
+import { env, requireAgentConfiguration } from "../config/env.ts";
+import {
+  getPaymentStatus,
+  RewindClientError,
+  requestPayment,
+} from "../api/rewind-client.ts";
+import type { RequestPaymentInput } from "../api/rewind-client.ts";
 
-const createPaymentOrder = tool(
-  async ({ amount, currency, description }) => {
-    try {
-      const order = await paypalClient.createOrder({
-        amount,
-        currency,
-        description,
-      });
-
-      const approvalLink = order.links.find(
-        (link) =>
-          link.rel === "approve" ||
-          link.rel === "payer-action"
-      );
-
-      if (!approvalLink) {
-        throw new Error(
-          "PayPal did not return an approval URL"
-        );
-      }
-
-      return {
-        success: true,
-        orderId: order.id,
-        status: order.status,
-        approvalUrl: approvalLink.href,
-        message: "Order created. Buyer approval is required.",
-      };
-    } catch (error) {
-      return {
-        success: false,
-        error:
-          error instanceof Error
-            ? error.message
-            : "Unknown PayPal error",
-      };
+export type PaymentAgentAction =
+  | {
+      tool: "request_payment";
+      success: true;
+      paymentId: string;
+      status: string;
+      approvalUrl: string | null;
     }
-  },
-  {
-    name: "create_paypal_order",
-
-    description:
-      "Creates a PayPal checkout order and returns the buyer approval URL. Does not charge the buyer.",
-
-    schema: z.object({
-      amount: z
-        .string()
-        .regex(/^\d+(\.\d{1,2})?$/)
-        .describe("Payment amount, e.g. 50.00"),
-
-      currency: z
-        .string()
-        .length(3)
-        .transform((value) => value.toUpperCase())
-        .describe("Three-letter currency code, e.g. USD"),
-
-      description: z
-        .string()
-        .min(1)
-        .max(127)
-        .describe("Description of the purchase"),
-    }),
-  }
-);
-
-const getPaymentOrder = tool(
-  async ({ orderId }) => {
-    try {
-      const order = await paypalClient.getOrder(orderId);
-
-      return {
-        success: true,
-        orderId: order.id,
-        status: order.status,
-        captures:
-          order.purchase_units?.flatMap(
-            (unit) => unit.payments?.captures ?? []
-          ) ?? [],
-      };
-    } catch (error) {
-      return {
-        success: false,
-        error:
-          error instanceof Error
-            ? error.message
-            : "Unknown PayPal error",
-      };
+  | {
+      tool: "request_payment" | "get_payment_status";
+      success: false;
+      error: { code: string; message: string };
     }
-  },
-  {
-    name: "get_paypal_order",
+  | {
+      tool: "get_payment_status";
+      success: true;
+      paymentId: string;
+      status: string;
+    };
 
-    description:
-      "Retrieves a PayPal order and checks its current payment status using the PayPal API.",
+export interface PaymentAgentResult {
+  message: string;
+  action: PaymentAgentAction | null;
+}
 
-    schema: z.object({
-      orderId: z.string().min(1),
-    }),
+function safeToolError(error: unknown): { code: string; message: string } {
+  if (error instanceof RewindClientError) {
+    return { code: error.code, message: error.message };
   }
-);
+  return { code: "INVALID_REQUEST", message: "The payment request could not be completed." };
+}
 
-const model = new ChatOpenRouter({
-  apiKey: env.OPENROUTER_API_KEY,
-  model: env.OPENROUTER_MODEL,
-  temperature: 0,
-});
-
-export const paymentAgent = createAgent({
-  model,
-
-  tools: [
-    createPaymentOrder,
-    getPaymentOrder,
-  ],
-
-  systemPrompt: `
-You are a PayPal payment assistant.
+const systemPrompt = `
+You are an assistant for a REWIND payment service.
 
 Your responsibilities:
 
-1. Help users create PayPal payment orders.
-2. Ask for missing payment details.
-3. Never invent an amount, currency, or product description.
-4. Use create_paypal_order to create an order.
-5. Return the approval URL to the user.
-6. Use get_paypal_order to retrieve payment status.
-7. Never claim that an order is paid merely because it was created.
-8. Only report a payment as completed when PayPal confirms
-   the order and its capture status.
-9. Never invent transaction IDs or payment confirmations.
-10. Never attempt to capture an order yourself.
+1. When the user gives an existing mandate ID, payee email, integer cents amount, and invoice ID for a payment request, call request_payment immediately.
+2. Never invent a mandate, amount, payee, or invoice ID. Ask for missing values.
+3. Use get_payment_status when a user asks about an existing payment and provides its payment ID.
+4. Report only the status and decision data returned by the tools.
+5. A requested or held payment is not yet a completed capture.
+6. Never claim to perform or authorize an operation that is not available through these two tools.
+`;
 
-All payments must use the configured PayPal environment.
-`,
-});
+export async function runPaymentAgent(
+  instruction: string,
+  apiBaseUrl = env.REWIND_API_BASE_URL,
+  expectedPayment?: RequestPaymentInput,
+): Promise<PaymentAgentResult> {
+  const configuration = requireAgentConfiguration();
+  let action: PaymentAgentAction | null = null;
+  const requestPaymentTool = tool(
+    async ({ mandateId, payeeEmail, amountCents, invoiceId }) => {
+      try {
+        if (expectedPayment && (
+          mandateId !== expectedPayment.mandateId ||
+          payeeEmail.trim().toLowerCase() !== expectedPayment.payeeEmail.toLowerCase() ||
+          amountCents !== expectedPayment.amountCents ||
+          invoiceId !== expectedPayment.invoiceId
+        )) {
+          action = {
+            tool: "request_payment",
+            success: false,
+            error: {
+              code: "AGENT_ARGUMENT_MISMATCH",
+              message: "The agent request did not match the payment details you submitted.",
+            },
+          };
+          return JSON.stringify(action);
+        }
+        const result = await requestPayment({
+          mandateId,
+          payeeEmail,
+          amountCents,
+          invoiceId,
+        }, apiBaseUrl);
+        action = {
+          tool: "request_payment",
+          success: true,
+          paymentId: result.paymentId,
+          status: result.status,
+          approvalUrl: result.approvalUrl,
+        };
+      } catch (error) {
+        action = { tool: "request_payment", success: false, error: safeToolError(error) };
+      }
+      return JSON.stringify(action?.tool === "request_payment" && action.success
+        ? {
+            tool: action.tool,
+            success: action.success,
+            paymentId: action.paymentId,
+            status: action.status,
+          }
+        : action);
+    },
+    {
+      name: "request_payment",
+      description:
+        "Requests a payment under an existing mandate. Returns only the payment ID and current status.",
+      schema: z.object({
+        mandateId: z.string().uuid().describe("Existing REWIND mandate ID"),
+        payeeEmail: z.string().email().describe("Mandated payee email"),
+        amountCents: z.number().int().positive().safe()
+          .describe("Payment amount as integer USD cents"),
+        invoiceId: z.string().min(1).max(127).describe("Unique invoice ID"),
+      }),
+    }
+  );
+  const getPaymentStatusTool = tool(
+    async ({ paymentId }) => {
+      try {
+        const result = await getPaymentStatus(paymentId, apiBaseUrl);
+        action = {
+          tool: "get_payment_status",
+          success: true,
+          paymentId: result.paymentId,
+          status: result.status,
+        };
+      } catch (error) {
+        action = { tool: "get_payment_status", success: false, error: safeToolError(error) };
+      }
+      return JSON.stringify(action);
+    },
+    {
+      name: "get_payment_status",
+      description:
+        "Gets the current status and Guardian decisions for a REWIND payment by payment ID.",
+      schema: z.object({
+        paymentId: z.string().uuid().describe("REWIND payment ID"),
+      }),
+    }
+  );
+
+  const agent = createAgent({
+    model: new ChatOpenRouter({
+      apiKey: configuration.apiKey,
+      model: configuration.model,
+      temperature: 0,
+    }),
+    tools: [requestPaymentTool, getPaymentStatusTool],
+    systemPrompt,
+  });
+  const result = await agent.invoke({
+    messages: [{ role: "user", content: instruction }],
+  });
+  const content = result.messages.at(-1)?.content;
+  const message = typeof content === "string"
+    ? content
+    : Array.isArray(content)
+    ? content.map((part) => typeof part === "string" ? part : JSON.stringify(part)).join("\n")
+    : "";
+  return { message, action };
+}

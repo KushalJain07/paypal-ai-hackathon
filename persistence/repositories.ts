@@ -55,7 +55,8 @@ export interface PaymentRepository {
   createRejected(
     input: ReservePaymentInput,
     reason: string,
-    detail: Record<string, string | number | boolean | null>,
+    decision: Decision,
+    createdAt: string,
   ): Promise<Payment>;
   attachOrder(
     paymentId: string,
@@ -70,8 +71,12 @@ export interface PaymentRepository {
     action: PaymentAction,
     at: string,
     dueAt?: string,
+    staleAfterSeconds?: number,
   ): Promise<boolean>;
   clearActionClaim(paymentId: string, action: PaymentAction): Promise<void>;
+  listStaleReleaseClaims(
+    before: string,
+  ): Promise<Array<{ payment: Payment; claimedAt: string }>>;
   getById(id: string): Promise<Payment | null>;
   listAll(): Promise<Payment[]>;
   listByMandate(mandateId: string): Promise<Payment[]>;

@@ -36,7 +36,10 @@ export class InMemoryPersistence implements PersistenceRepositories {
   private readonly paymentRows = new Map<string, Payment>();
   private readonly decisionRows: DecisionRecord[] = [];
   private readonly eventRows: PaymentEvent[] = [];
-  private readonly actionClaims = new Map<string, PaymentAction>();
+  private readonly actionClaims = new Map<
+    string,
+    { action: PaymentAction; claimedAt: string }
+  >();
   private nextDecisionId = 1;
   private nextEventId = 1;
 
@@ -62,8 +65,20 @@ export class InMemoryPersistence implements PersistenceRepositories {
           "The requested mandate does not exist.",
         );
       }
-      this.mandateRows.set(validated.id, structuredClone(validated));
-      return mandateSchema.parse(structuredClone(validated));
+      const current = this.mandateRows.get(validated.id);
+      if (!current) {
+        throw new PersistenceError(
+          "MANDATE_NOT_FOUND",
+          "The requested mandate does not exist.",
+        );
+      }
+      const updated = mandateSchema.parse({
+        ...validated,
+        spent_total: current.spent_total,
+        reserved_total: current.reserved_total,
+      });
+      this.mandateRows.set(validated.id, structuredClone(updated));
+      return mandateSchema.parse(structuredClone(updated));
     },
 
     getById: async (id: string): Promise<Mandate | null> => {
@@ -84,8 +99,10 @@ export class InMemoryPersistence implements PersistenceRepositories {
     createRejected: async (
       input: ReservePaymentInput,
       reason: string,
-      detail: Record<string, string | number | boolean | null>,
-    ): Promise<Payment> => this.createRejectedPayment(input, reason, detail),
+      decision: Decision,
+      createdAt: string,
+    ): Promise<Payment> =>
+      this.createRejectedPayment(input, reason, decision, createdAt),
 
     attachOrder: async (
       paymentId: string,
@@ -104,21 +121,52 @@ export class InMemoryPersistence implements PersistenceRepositories {
       action: PaymentAction,
       at: string,
       dueAt?: string,
+      staleAfterSeconds?: number,
     ): Promise<boolean> => this.claimPaymentAction(
       paymentId,
       expectedStatus,
       action,
       at,
       dueAt,
+      staleAfterSeconds,
     ),
 
     clearActionClaim: async (
       paymentId: string,
       action: PaymentAction,
     ): Promise<void> => {
-      if (this.actionClaims.get(repositoryIdSchema.parse(paymentId)) === action) {
+      if (
+        this.actionClaims.get(repositoryIdSchema.parse(paymentId))?.action ===
+        action
+      ) {
         this.actionClaims.delete(paymentId);
       }
+    },
+
+    listStaleReleaseClaims: async (
+      before: string,
+    ): Promise<Array<{ payment: Payment; claimedAt: string }>> => {
+      const cutoff = Date.parse(before);
+      if (!Number.isFinite(cutoff)) {
+        throw new PersistenceError("INVALID_RECORD", "Claim cutoff is invalid.");
+      }
+      return [...this.actionClaims.entries()]
+        .flatMap(([paymentId, claim]) => {
+          const payment = this.paymentRows.get(paymentId);
+          if (
+            claim.action !== "release" ||
+            Date.parse(claim.claimedAt) >= cutoff ||
+            !payment ||
+            payment.status !== "held"
+          ) {
+            return [];
+          }
+          return [{
+            payment: paymentSchema.parse(structuredClone(payment)),
+            claimedAt: claim.claimedAt,
+          }];
+        })
+        .sort((left, right) => left.claimedAt.localeCompare(right.claimedAt));
     },
 
     getById: async (id: string): Promise<Payment | null> => {
@@ -389,9 +437,13 @@ export class InMemoryPersistence implements PersistenceRepositories {
   private createRejectedPayment(
     input: ReservePaymentInput,
     reason: string,
-    detail: Record<string, string | number | boolean | null>,
+    decision: Decision,
+    createdAt: string,
   ): Payment {
     const request = reservePaymentInputSchema.parse(input);
+    const validatedDecision = decisionSchema.parse(decision);
+    const validatedReason = z.string().min(1).max(128).parse(reason);
+    const validatedAt = z.string().datetime({ offset: true }).parse(createdAt);
     if (this.paymentRows.has(request.id)) {
       throw new PersistenceError(
         "DUPLICATE_PAYMENT",
@@ -411,23 +463,41 @@ export class InMemoryPersistence implements PersistenceRepositories {
       capture_id: null,
       status: "rejected",
       release_at: null,
-      failure_reason: reason,
-      created_at: request.created_at,
-      updated_at: request.created_at,
+      failure_reason: validatedReason,
+      created_at: validatedAt,
+      updated_at: validatedAt,
     });
     const event = appendPaymentEventSchema.parse({
       payment_id: payment.id,
       type: "payment_rejected",
       from_status: null,
       to_status: "rejected",
-      detail: { ...detail, reason },
-      created_at: request.created_at,
+      detail: {
+        failed_rules: validatedDecision.results
+          .filter((result) => !result.passed)
+          .map((result) => result.rule)
+          .join(","),
+        reason: validatedReason,
+        phase: validatedDecision.phase,
+      },
+      created_at: validatedAt,
     });
+    const decisionRecords = validatedDecision.results.map((result) =>
+      decisionRecordSchema.parse({
+        id: this.nextDecisionId,
+        payment_id: payment.id,
+        phase: validatedDecision.phase,
+        ...result,
+        created_at: validatedAt,
+      }),
+    );
     this.paymentRows.set(payment.id, payment);
     this.eventRows.push(
       paymentEventSchema.parse({ ...event, id: this.nextEventId }),
     );
     this.nextEventId += 1;
+    this.decisionRows.push(...decisionRecords);
+    this.nextDecisionId += decisionRecords.length;
     return paymentSchema.parse(structuredClone(payment));
   }
 
@@ -480,6 +550,15 @@ export class InMemoryPersistence implements PersistenceRepositories {
       throw new PersistenceError(
         "PAYMENT_STATUS_CONFLICT",
         "The payment status changed before this operation completed.",
+      );
+    }
+    if (
+      input.claimAction &&
+      this.actionClaims.get(paymentId)?.action !== input.claimAction
+    ) {
+      throw new PersistenceError(
+        "ACTION_ALREADY_CLAIMED",
+        "The payment action claim is missing or no longer active.",
       );
     }
     transitionPaymentStatus(current.status, input.nextStatus);
@@ -548,10 +627,18 @@ export class InMemoryPersistence implements PersistenceRepositories {
     action: PaymentAction,
     at: string,
     dueAt?: string,
+    staleAfterSeconds = 120,
   ): boolean {
     const id = repositoryIdSchema.parse(paymentId);
+    const validatedStaleAfterSeconds = z.number().int().positive().max(86400)
+      .parse(staleAfterSeconds);
     const payment = this.paymentRows.get(id);
-    if (!payment || payment.status !== expectedStatus || this.actionClaims.has(id)) {
+    const existingClaim = this.actionClaims.get(id);
+    const claimIsActive =
+      existingClaim !== undefined &&
+      Date.parse(existingClaim.claimedAt) >
+        Date.parse(at) - validatedStaleAfterSeconds * 1000;
+    if (!payment || payment.status !== expectedStatus || claimIsActive) {
       return false;
     }
     if (
@@ -574,7 +661,7 @@ export class InMemoryPersistence implements PersistenceRepositories {
     if (!Number.isFinite(Date.parse(at))) {
       throw new PersistenceError("INVALID_RECORD", "Action time is invalid.");
     }
-    this.actionClaims.set(id, action);
+    this.actionClaims.set(id, { action, claimedAt: at });
     return true;
   }
 

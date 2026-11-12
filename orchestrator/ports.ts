@@ -19,6 +19,7 @@ import type {
   PaymentAction,
   PaymentTransitionInput,
 } from "../persistence/repositories.ts";
+import type { Notifier } from "../notifications/notifier.ts";
 
 export interface Clock {
   now(): Date;
@@ -40,7 +41,8 @@ export interface PaymentRepo {
   createRejected(
     input: ReservePaymentInput,
     reason: string,
-    detail: Record<string, string | number | boolean | null>,
+    decision: Decision,
+    createdAt: string,
   ): Promise<Payment>;
   attachOrder(
     paymentId: string,
@@ -55,8 +57,12 @@ export interface PaymentRepo {
     action: PaymentAction,
     at: string,
     dueAt?: string,
+    staleAfterSeconds?: number,
   ): Promise<boolean>;
   clearActionClaim(paymentId: string, action: PaymentAction): Promise<void>;
+  listStaleReleaseClaims(
+    before: string,
+  ): Promise<Array<{ payment: Payment; claimedAt: string }>>;
   getById(id: string): Promise<Payment | null>;
   listAll(): Promise<Payment[]>;
   listDue(at: string): Promise<Payment[]>;
@@ -91,6 +97,7 @@ export interface OrchestratorDependencies {
   clock: Clock;
   ids: IdGenerator;
   signingSecret?: string;
+  notifier?: Notifier;
 }
 
 export interface PaymentRequestInput {
@@ -115,6 +122,12 @@ export interface PaymentDetail {
 export interface ReleaseResult {
   paymentId: string;
   status: "captured" | "failed" | "skipped";
+  error?: string;
+}
+
+export interface StaleReleaseResult {
+  paymentId: string;
+  status: "captured" | "held" | "failed" | "skipped";
   error?: string;
 }
 

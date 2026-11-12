@@ -17,6 +17,7 @@ create table public.payment_action_claims (
   action text not null check (action in ('undo', 'release', 'refund')),
   claimed_at timestamptz not null
 );
+alter table public.payment_action_claims enable row level security;
 
 create or replace function public.reserve_payment(
   p_id uuid,
@@ -112,7 +113,7 @@ create function public.create_rejected_payment(
   p_payee_email text,
   p_created_at timestamptz,
   p_reason text,
-  p_detail jsonb
+  p_decision jsonb
 )
 returns setof public.payments
 language plpgsql
@@ -136,9 +137,70 @@ begin
   )
   values (
     v_payment.id, 'payment_rejected', null, 'rejected',
-    p_detail || jsonb_build_object('reason', p_reason), p_created_at
+    jsonb_build_object(
+      'failed_rules',
+      (select coalesce(string_agg(item->>'rule', ','), '')
+         from jsonb_array_elements(p_decision->'results') as result(item)
+        where not coalesce((item->>'passed')::boolean, false)
+      ),
+      'reason', p_reason,
+      'phase', p_decision->>'phase'
+    ),
+    p_created_at
   );
+  insert into public.decisions (
+    payment_id, phase, rule, passed, expected, actual, created_at
+  )
+  select
+    v_payment.id,
+    p_decision->>'phase',
+    item->>'rule',
+    (item->>'passed')::boolean,
+    item->'expected',
+    item->'actual',
+    p_created_at
+  from jsonb_array_elements(p_decision->'results') as result(item);
   return next v_payment;
+end;
+$$;
+
+create function public.update_mandate(p_mandate jsonb)
+returns setof public.mandates
+language plpgsql
+set search_path = ''
+as $$
+declare
+  v_current public.mandates%rowtype;
+  v_updated public.mandates%rowtype;
+begin
+  if jsonb_typeof(p_mandate) is distinct from 'object' then
+    raise exception using errcode = 'P0001', message = 'INVALID_RECORD';
+  end if;
+  select * into v_current
+    from public.mandates
+   where id = (p_mandate->>'id')::uuid
+   for update;
+  if not found then
+    raise exception using errcode = 'P0001', message = 'MANDATE_NOT_FOUND';
+  end if;
+  v_updated := jsonb_populate_record(v_current, p_mandate);
+  update public.mandates
+     set version = v_updated.version,
+         payee_email = v_updated.payee_email,
+         per_payment_cap = v_updated.per_payment_cap,
+         total_cap = v_updated.total_cap,
+         spent_total = v_current.spent_total,
+         reserved_total = v_current.reserved_total,
+         currency = v_updated.currency,
+         purpose = v_updated.purpose,
+         expires_at = v_updated.expires_at,
+         undo_window_seconds = v_updated.undo_window_seconds,
+         status = v_updated.status,
+         signature = v_updated.signature,
+         hash = v_updated.hash
+   where id = v_current.id
+   returning * into v_updated;
+  return next v_updated;
 end;
 $$;
 
@@ -218,7 +280,10 @@ begin
 
   insert into public.payment_action_claims (payment_id, action, claimed_at)
   values (p_payment_id, p_action, p_at)
-  on conflict (payment_id) do nothing
+  on conflict (payment_id) do update
+    set action = excluded.action,
+        claimed_at = excluded.claimed_at
+    where public.payment_action_claims.claimed_at <= p_at - interval '2 minutes'
   returning payment_id into v_claimed;
   return v_claimed is not null;
 end;
@@ -330,6 +395,14 @@ begin
     coalesce(p_detail, '{}'::jsonb), p_at
   );
   if p_claim_action is not null then
+    if not exists (
+      select 1
+        from public.payment_action_claims
+        where payment_id = p_payment_id
+          and action = p_claim_action
+    ) then
+      raise exception using errcode = 'P0001', message = 'ACTION_ALREADY_CLAIMED';
+    end if;
     delete from public.payment_action_claims
      where payment_id = p_payment_id and action = p_claim_action;
   end if;
@@ -338,9 +411,29 @@ end;
 $$;
 
 grant select, insert, update, delete on public.payment_action_claims to service_role;
+revoke all on function public.reserve_payment(
+  uuid, uuid, text, bigint, text, text, timestamptz
+) from public, anon, authenticated;
+revoke all on function public.create_rejected_payment(
+  uuid, uuid, text, bigint, text, text, timestamptz, text, jsonb
+) from public, anon, authenticated;
+revoke all on function public.update_mandate(jsonb)
+  from public, anon, authenticated;
+revoke all on function public.attach_paypal_order(uuid, text, text, timestamptz)
+  from public, anon, authenticated;
+revoke all on function public.claim_payment_action(
+  uuid, text, text, timestamptz, timestamptz
+) from public, anon, authenticated;
+revoke all on function public.clear_payment_action_claim(uuid, text)
+  from public, anon, authenticated;
+revoke all on function public.transition_payment(
+  uuid, text, text, timestamptz, text, text, jsonb, text, text, text,
+  timestamptz, text, text
+) from public, anon, authenticated;
 grant execute on function public.create_rejected_payment(
   uuid, uuid, text, bigint, text, text, timestamptz, text, jsonb
 ) to service_role;
+grant execute on function public.update_mandate(jsonb) to service_role;
 grant execute on function public.attach_paypal_order(uuid, text, text, timestamptz)
   to service_role;
 grant execute on function public.claim_payment_action(

@@ -1,26 +1,17 @@
-import { paymentAgent } from "./agent/payment-agent";
+import { runPaymentAgent } from "./agent/payment-agent.ts";
 
 async function main(): Promise<void> {
-  try {
-    const result = await paymentAgent.invoke({
-      messages: [
-        {
-          role: "user",
-          content:
-            "Create a PayPal order for 50 USD for Premium News service.",
-        },
-      ],
-    });
-
-    const lastMessage = result.messages.at(-1);
-
-    console.log("\nAgent response:\n");
-    console.log(lastMessage?.content);
-
-  } catch (error) {
-    console.error("Agent execution failed:", error);
-    process.exitCode = 1;
+  const instruction = process.argv.slice(2).join(" ").trim();
+  if (!instruction) {
+    console.error('Provide a payment instruction as an argument, for example: node src/index.ts "Request 250 cents under mandate <id> for buyer@example.com, invoice inv-123".');
+    process.exitCode = 2;
+    return;
   }
+  const result = await runPaymentAgent(instruction);
+  console.log(result.message);
 }
 
-main();
+main().catch(() => {
+  console.error("Agent execution failed. Check the API and OpenRouter configuration.");
+  process.exitCode = 1;
+});

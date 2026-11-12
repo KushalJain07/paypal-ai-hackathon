@@ -100,6 +100,10 @@ export interface Database {
         };
         Returns: PaymentRow[];
       };
+      update_mandate: {
+        Args: { p_mandate: JsonValue };
+        Returns: MandateRow[];
+      };
       create_rejected_payment: {
         Args: {
           p_id: string;
@@ -110,7 +114,7 @@ export interface Database {
           p_payee_email: string;
           p_created_at: string;
           p_reason: string;
-          p_detail: JsonValue;
+          p_decision: JsonValue;
         };
         Returns: PaymentRow[];
       };
@@ -132,6 +136,21 @@ export interface Database {
           p_due_at?: string | null;
         };
         Returns: boolean;
+      };
+      claim_payment_action_v2: {
+        Args: {
+          p_payment_id: string;
+          p_expected_status: string;
+          p_action: string;
+          p_at: string;
+          p_due_at?: string | null;
+          p_stale_after_seconds: number;
+        };
+        Returns: boolean;
+      };
+      list_stale_release_claims: {
+        Args: { p_before: string };
+        Returns: Array<{ payment_id: string; claimed_at: string }>;
       };
       clear_payment_action_claim: {
         Args: { p_payment_id: string; p_action: string };

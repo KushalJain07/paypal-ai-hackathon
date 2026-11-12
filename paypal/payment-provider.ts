@@ -57,6 +57,7 @@ export interface Capture {
   status: CaptureStatus;
   amountCents: number;
   currency: string;
+  finalCapture: boolean | null;
 }
 
 export interface Refund {
@@ -76,6 +77,11 @@ export interface PaymentProvider {
     paymentId: string,
     authorizationId: string,
   ): Promise<Capture>;
+  findCaptureForAuthorization?(
+    paymentId: string,
+    orderId: string,
+    authorizationId: string,
+  ): Promise<Capture | null>;
   voidAuthorization(
     paymentId: string,
     authorizationId: string,

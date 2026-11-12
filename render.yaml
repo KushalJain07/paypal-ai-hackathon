@@ -1,0 +1,82 @@
+services:
+  - type: web
+    name: rewind-web
+    runtime: node
+    buildCommand: npm ci && npm run build
+    startCommand: npm run start
+    healthCheckPath: /api/rewind/health
+    envVars:
+      - key: NODE_VERSION
+        value: 24.16.0
+      - key: PAYPAL_CLIENT_ID
+        sync: false
+      - key: PAYPAL_CLIENT_SECRET
+        sync: false
+      - key: PAYPAL_BASE_URL
+        value: https://api-m.sandbox.paypal.com
+      - key: MANDATE_SIGNING_SECRET
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: APPROVAL_PROVIDER
+        value: kernel
+      - key: APPROVAL_FALLBACK_MANUAL
+        value: "true"
+      - key: KERNEL_API_KEY
+        sync: false
+      - key: KERNEL_PROFILE_NAME
+        sync: false
+      - key: SANDBOX_BUYER_EMAIL
+        sync: false
+      - key: SANDBOX_BUYER_PASSWORD
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: OPENROUTER_MODEL
+        sync: false
+      - key: WORKER_INTERVAL_MS
+        value: "3000"
+      - key: STALE_CLAIM_SECONDS
+        value: "120"
+      - key: ZAPIER_WEBHOOK_URL
+        sync: false
+  - type: worker
+    name: rewind-worker
+    runtime: node
+    buildCommand: npm ci && npm run build
+    startCommand: npm run worker
+    envVars:
+      - key: NODE_VERSION
+        value: 24.16.0
+      - key: PAYPAL_CLIENT_ID
+        sync: false
+      - key: PAYPAL_CLIENT_SECRET
+        sync: false
+      - key: PAYPAL_BASE_URL
+        value: https://api-m.sandbox.paypal.com
+      - key: MANDATE_SIGNING_SECRET
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: APPROVAL_PROVIDER
+        value: kernel
+      - key: APPROVAL_FALLBACK_MANUAL
+        value: "true"
+      - key: KERNEL_API_KEY
+        sync: false
+      - key: KERNEL_PROFILE_NAME
+        sync: false
+      - key: SANDBOX_BUYER_EMAIL
+        sync: false
+      - key: SANDBOX_BUYER_PASSWORD
+        sync: false
+      - key: WORKER_INTERVAL_MS
+        value: "3000"
+      - key: STALE_CLAIM_SECONDS
+        value: "120"
+      - key: ZAPIER_WEBHOOK_URL
+        sync: false

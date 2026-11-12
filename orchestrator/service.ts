@@ -15,20 +15,25 @@ import {
   type PaymentStatus,
 } from "../domain/payment.ts";
 import { transitionPaymentStatus } from "../domain/state-machine.ts";
-import {
-  PayPalProviderError,
-  type Authorization,
-  type Capture,
+import type {
+  Authorization,
+  Capture,
 } from "../paypal/payment-provider.ts";
-import { PersistenceError } from "../persistence/repositories.ts";
-import { reservePaymentInputSchema } from "../persistence/schemas.ts";
+import {
+  reservePaymentInputSchema,
+  type ReservePaymentInput,
+} from "../persistence/schemas.ts";
 import type {
   OrchestratorDependencies,
   PaymentDetail,
   PaymentRequestInput,
   PaymentRequestResult,
   ReleaseResult,
+  StaleReleaseResult,
 } from "./ports.ts";
+import type {
+  PaymentNotification,
+} from "../notifications/notifier.ts";
 
 const requestSchema = z
   .object({
@@ -42,6 +47,14 @@ const requestSchema = z
 const mandateIdSchema = z.string().uuid();
 const paymentIdSchema = z.string().uuid();
 const errorCodeSchema = z.string().regex(/^[A-Z0-9_-]{1,128}$/);
+const reservationRejectionCodes = [
+  "DUPLICATE_INVOICE",
+  "BUDGET_EXCEEDED",
+  "MANDATE_INACTIVE",
+  "MANDATE_EXPIRED",
+  "PAYMENT_AMOUNT_INVALID",
+  "CURRENCY_MISMATCH",
+] as const;
 
 export class OrchestratorError extends Error {
   readonly code: string;
@@ -62,7 +75,7 @@ function canonicalMandate(mandate: Omit<Mandate, "signature" | "hash">): string 
     total_cap: mandate.total_cap,
     currency: mandate.currency,
     purpose: mandate.purpose,
-    expires_at: mandate.expires_at,
+    expires_at: new Date(mandate.expires_at).toISOString(),
     undo_window_seconds: mandate.undo_window_seconds,
     status: mandate.status,
   });
@@ -79,31 +92,30 @@ function signatureFor(canonical: string, secret: string): {
 }
 
 function safeFailureCode(error: unknown): string {
-  if (error instanceof PayPalProviderError) {
-    return error.code;
+  if (error && typeof error === "object" && "code" in error) {
+    const parsedCode = errorCodeSchema.safeParse(error.code);
+    if (parsedCode.success) {
+      return parsedCode.data;
+    }
   }
-  if (error instanceof PersistenceError) {
-    return error.code;
+  if (error instanceof Error) {
+    const parsedName = errorCodeSchema.safeParse(error.name.toUpperCase());
+    if (parsedName.success) {
+      return parsedName.data;
+    }
   }
-  return errorCodeSchema.safeParse(
-    error instanceof Error ? error.name.toUpperCase() : "",
-  ).success
-    ? (error as Error).name.toUpperCase()
-    : "OPERATION_FAILED";
+  return "OPERATION_FAILED";
 }
 
-function isReservationRejection(error: unknown): error is PersistenceError {
-  return (
-    error instanceof PersistenceError &&
-    [
-      "DUPLICATE_INVOICE",
-      "BUDGET_EXCEEDED",
-      "MANDATE_INACTIVE",
-      "MANDATE_EXPIRED",
-      "PAYMENT_AMOUNT_INVALID",
-      "CURRENCY_MISMATCH",
-    ].includes(error.code)
-  );
+function isReservationRejection(error: unknown): boolean {
+  if (!error || typeof error !== "object" || !("code" in error)) {
+    return false;
+  }
+  const parsedCode = errorCodeSchema.safeParse(error.code);
+  return parsedCode.success &&
+    reservationRejectionCodes.includes(
+      parsedCode.data as (typeof reservationRejectionCodes)[number],
+    );
 }
 
 function assertValidNow(date: Date): string {
@@ -146,8 +158,10 @@ function assertTransition(from: PaymentStatus, to: PaymentStatus): void {
 
 export class PaymentOrchestrator {
   private readonly signingSecret: string;
+  private readonly dependencies: OrchestratorDependencies;
 
-  constructor(private readonly dependencies: OrchestratorDependencies) {
+  constructor(dependencies: OrchestratorDependencies) {
+    this.dependencies = dependencies;
     const secret =
       dependencies.signingSecret ?? process.env.MANDATE_SIGNING_SECRET ?? "";
     if (secret.length < 32) {
@@ -180,14 +194,15 @@ export class PaymentOrchestrator {
 
   async revokeMandate(mandateId: string): Promise<Mandate> {
     const id = mandateIdSchema.parse(mandateId);
-    const mandate = await this.dependencies.mandates.getById(id);
-    if (!mandate) {
-      throw new OrchestratorError("MANDATE_NOT_FOUND", "Mandate not found.");
-    }
+    const mandate = await this.requireMandate(id);
     if (mandate.status === "revoked") {
       return mandate;
     }
-    const unsigned = { ...mandate, status: "revoked" as const };
+    const unsigned = {
+      ...mandate,
+      version: mandate.version + 1,
+      status: "revoked" as const,
+    };
     const signed = {
       ...unsigned,
       ...signatureFor(canonicalMandate(unsigned), this.signingSecret),
@@ -201,10 +216,7 @@ export class PaymentOrchestrator {
     const input = requestSchema.parse(rawInput);
     const paymentId = paymentIdSchema.parse(this.dependencies.ids.next());
     const at = assertValidNow(this.dependencies.clock.now());
-    const mandate = await this.dependencies.mandates.getById(input.mandateId);
-    if (!mandate) {
-      throw new OrchestratorError("MANDATE_NOT_FOUND", "Mandate not found.");
-    }
+    const mandate = await this.requireMandate(input.mandateId);
     const effectiveMandate = this.effectiveMandate(mandate, at);
     const budget = await this.dependencies.payments.getBudgetState(mandate.id);
     const observed = makeObservedFromRequest(input);
@@ -232,6 +244,7 @@ export class PaymentOrchestrator {
         "GUARDIAN_PREFLIGHT_REJECTED",
         at,
       );
+      this.notify({ type: "rejected", payment, failedRules: failedRules(preflight) });
       return { payment, decision: preflight, approvalUrl: null };
     }
 
@@ -257,10 +270,27 @@ export class PaymentOrchestrator {
       const payment = await this.persistRejection(
         reserveInput,
         currentDecision,
-        error.code,
+        safeFailureCode(error),
         at,
       );
+      this.notify({
+        type: "rejected",
+        payment,
+        failedRules: failedRules(currentDecision),
+      });
       return { payment, decision: currentDecision, approvalUrl: null };
+    }
+
+    try {
+      await this.dependencies.decisions.append(
+        payment.id,
+        preflight,
+        at,
+        "preflight",
+      );
+    } catch (error) {
+      await this.failPayment(payment, "requested", error, "release_reserved");
+      throw this.toOrchestratorError(error);
     }
 
     let order;
@@ -281,7 +311,10 @@ export class PaymentOrchestrator {
       order.paypalOrderId,
       order.approvalUrl,
       assertValidNow(this.dependencies.clock.now()),
-    );
+    ).catch(async (error: unknown) => {
+      await this.failPayment(payment, "requested", error, "release_reserved");
+      throw this.toOrchestratorError(error);
+    });
     return {
       payment: attached,
       decision: preflight,
@@ -306,11 +339,21 @@ export class PaymentOrchestrator {
     const mandate = await this.requireMandate(payment.mandate_id);
     let authorization: Authorization;
     try {
-      await this.dependencies.approvalProvider.approve({
+      const approval = await this.dependencies.approvalProvider.approve({
         paymentId: payment.id,
         paypalOrderId: payment.paypal_order_id,
         approvalUrl: payment.approval_url,
       });
+      if (
+        approval.status !== "APPROVED" ||
+        approval.paymentId !== payment.id ||
+        approval.paypalOrderId !== payment.paypal_order_id
+      ) {
+        throw new OrchestratorError(
+          "APPROVAL_NOT_VERIFIED",
+          "The approval provider did not confirm this PayPal order.",
+        );
+      }
       authorization = await this.dependencies.paymentProvider.authorizeOrder(
         payment.id,
         payment.paypal_order_id,
@@ -350,6 +393,7 @@ export class PaymentOrchestrator {
     }
 
     const matchedAuthorization =
+      orderSnapshot.paypalOrderId === payment.paypal_order_id &&
       authorizationSnapshot.authorizationId === authorization.authorizationId &&
       authorizationSnapshot.amountCents === payment.amount &&
       authorizationSnapshot.currency === payment.currency &&
@@ -404,7 +448,7 @@ export class PaymentOrchestrator {
         );
         return failed;
       }
-      return this.dependencies.payments.transition({
+      const rejected = await this.dependencies.payments.transition({
         paymentId: payment.id,
         expectedStatus: "authorized",
         nextStatus: "rejected",
@@ -415,6 +459,12 @@ export class PaymentOrchestrator {
         authorizationId: authorizationSnapshot.authorizationId,
         failureReason: "GUARDIAN_AUTHORIZED_REJECTED",
       });
+      this.notify({
+        type: "rejected",
+        payment: rejected,
+        failedRules: failedRules(authorizedDecision),
+      });
+      return rejected;
     }
 
     const releaseAt = new Date(
@@ -422,7 +472,7 @@ export class PaymentOrchestrator {
         mandate.undo_window_seconds * 1000,
     ).toISOString();
     assertTransition("authorized", "held");
-    return this.dependencies.payments.transition({
+    const held = await this.dependencies.payments.transition({
       paymentId: payment.id,
       expectedStatus: "authorized",
       nextStatus: "held",
@@ -433,6 +483,8 @@ export class PaymentOrchestrator {
       authorizationId: authorizationSnapshot.authorizationId,
       releaseAt,
     });
+    this.notify({ type: "held", payment: held });
+    return held;
   }
 
   async undo(paymentId: string): Promise<Payment> {
@@ -462,8 +514,9 @@ export class PaymentOrchestrator {
         "The payment is already being released or undone.",
       );
     }
+    let authorization: Authorization;
     try {
-      const authorization = await this.dependencies.paymentProvider.voidAuthorization(
+      authorization = await this.dependencies.paymentProvider.voidAuthorization(
         payment.id,
         payment.authorization_id,
       );
@@ -473,7 +526,12 @@ export class PaymentOrchestrator {
           "PayPal did not confirm the authorization was voided.",
         );
       }
-      return await this.dependencies.payments.transition({
+    } catch (error) {
+      await this.failPayment(payment, "held", error, "release_reserved", "undo");
+      throw this.toOrchestratorError(error);
+    }
+    try {
+      const voided = await this.dependencies.payments.transition({
         paymentId: payment.id,
         expectedStatus: "held",
         nextStatus: "voided",
@@ -484,14 +542,21 @@ export class PaymentOrchestrator {
         authorizationId: authorization.authorizationId,
         claimAction: "undo",
       });
+      this.notify({ type: "voided", payment: voided });
+      return voided;
     } catch (error) {
-      await this.failPayment(payment, "held", error, "release_reserved", "undo");
+      await this.dependencies.payments.clearActionClaim(payment.id, "undo");
       throw this.toOrchestratorError(error);
     }
   }
 
-  async releaseDue(now: Date): Promise<ReleaseResult[]> {
+  async releaseDue(
+    now: Date,
+    staleAfterSeconds = 120,
+  ): Promise<ReleaseResult[]> {
     const at = assertValidNow(now);
+    const staleSeconds = z.number().int().positive().max(86400)
+      .parse(staleAfterSeconds);
     const duePayments = await this.dependencies.payments.listDue(at);
     const results: ReleaseResult[] = [];
     for (const payment of duePayments) {
@@ -499,13 +564,16 @@ export class PaymentOrchestrator {
         results.push({ paymentId: payment.id, status: "skipped" });
         continue;
       }
+      let claimed = false;
+      let captureReturned = false;
       try {
-        const claimed = await this.dependencies.payments.claimAction(
+        claimed = await this.dependencies.payments.claimAction(
           payment.id,
           "held",
           "release",
           assertValidNow(this.dependencies.clock.now()),
           at,
+          staleSeconds,
         );
         if (!claimed) {
           results.push({ paymentId: payment.id, status: "skipped" });
@@ -515,8 +583,21 @@ export class PaymentOrchestrator {
           payment.id,
           payment.authorization_id,
         );
+        captureReturned = true;
+        if (capture.status === "PENDING") {
+          await this.dependencies.payments.clearActionClaim(
+            payment.id,
+            "release",
+          );
+          results.push({
+            paymentId: payment.id,
+            status: "skipped",
+            error: "CAPTURE_PENDING",
+          });
+          continue;
+        }
         this.assertFullCapture(capture, payment);
-        await this.dependencies.payments.transition({
+        const capturedPayment = await this.dependencies.payments.transition({
           paymentId: payment.id,
           expectedStatus: "held",
           nextStatus: "captured",
@@ -527,11 +608,21 @@ export class PaymentOrchestrator {
           captureId: capture.captureId,
           claimAction: "release",
         });
+        this.notify({ type: "captured", payment: capturedPayment });
         results.push({ paymentId: payment.id, status: "captured" });
       } catch (error) {
         const current = await this.dependencies.payments.getById(payment.id);
         let finalError = this.safeErrorCode(error);
-        if (current?.status === "held") {
+        const captureOutcomeUncertain =
+          finalError === "CAPTURE_RECOVERY_PENDING";
+        if (captureReturned || captureOutcomeUncertain) {
+          if (claimed) {
+            await this.dependencies.payments.clearActionClaim(
+              payment.id,
+              "release",
+            );
+          }
+        } else if (current?.status === "held" && claimed) {
           try {
             await this.failPayment(current, "held", error, "release_reserved", "release");
           } catch (finalizeError) {
@@ -540,8 +631,151 @@ export class PaymentOrchestrator {
         }
         results.push({
           paymentId: payment.id,
-          status: current?.status === "held" ? "failed" : "skipped",
+          status:
+            current?.status === "held" &&
+              claimed &&
+              !captureReturned &&
+              !captureOutcomeUncertain
+              ? "failed"
+              : "skipped",
           error: finalError,
+        });
+      }
+    }
+    return results;
+  }
+
+  async recoverStaleReleases(
+    now: Date,
+    staleAfterSeconds = 120,
+  ): Promise<StaleReleaseResult[]> {
+    const at = assertValidNow(now);
+    const staleSeconds = z.number().int().positive().max(86400)
+      .parse(staleAfterSeconds);
+    const cutoff = new Date(now.getTime() - staleSeconds * 1000).toISOString();
+    const staleClaims = await this.dependencies.payments.listStaleReleaseClaims(cutoff);
+    const results: StaleReleaseResult[] = [];
+
+    for (const { payment } of staleClaims) {
+      if (
+        payment.status !== "held" ||
+        !payment.paypal_order_id ||
+        !payment.authorization_id
+      ) {
+        results.push({ paymentId: payment.id, status: "skipped" });
+        continue;
+      }
+
+      let claimed: boolean;
+      try {
+        claimed = await this.dependencies.payments.claimAction(
+          payment.id,
+          "held",
+          "release",
+          at,
+          at,
+          staleSeconds,
+        );
+      } catch (error) {
+        results.push({
+          paymentId: payment.id,
+          status: "skipped",
+          error: this.safeErrorCode(error),
+        });
+        continue;
+      }
+      if (!claimed) {
+        results.push({ paymentId: payment.id, status: "skipped" });
+        continue;
+      }
+
+      try {
+        const authorization = await this.dependencies.paymentProvider.getAuthorization(
+          payment.id,
+          payment.authorization_id,
+        );
+        const findCapture = this.dependencies.paymentProvider
+          .findCaptureForAuthorization;
+        if (!findCapture) {
+          throw new OrchestratorError(
+            "CAPTURE_RECOVERY_UNAVAILABLE",
+            "PayPal capture recovery is unavailable.",
+          );
+        }
+        const capture = await findCapture.call(
+          this.dependencies.paymentProvider,
+          payment.id,
+          payment.paypal_order_id,
+          payment.authorization_id,
+        );
+        if (capture?.status === "COMPLETED") {
+          this.assertFullCapture(capture, payment);
+          const capturedPayment = await this.dependencies.payments.transition({
+            paymentId: payment.id,
+            expectedStatus: "held",
+            nextStatus: "captured",
+            at,
+            budgetEffect: "reserved_to_spent",
+            eventType: "payment_captured",
+            detail: { capture_id: capture.captureId, recovered: true },
+            captureId: capture.captureId,
+            claimAction: "release",
+          });
+          this.notify({ type: "captured", payment: capturedPayment });
+          results.push({ paymentId: payment.id, status: "captured" });
+          continue;
+        }
+        if (capture?.status === "PENDING") {
+          await this.dependencies.payments.clearActionClaim(payment.id, "release");
+          results.push({
+            paymentId: payment.id,
+            status: "held",
+            error: "CAPTURE_PENDING",
+          });
+          continue;
+        }
+
+        if (
+          authorization.status === "VOIDED" ||
+          authorization.status === "DENIED" ||
+          authorization.status === "EXPIRED"
+        ) {
+          await this.failPayment(
+            payment,
+            "held",
+            new OrchestratorError(
+              `AUTHORIZATION_${authorization.status}`,
+              "PayPal authorization is no longer capturable.",
+            ),
+            "release_reserved",
+            "release",
+          );
+          results.push({ paymentId: payment.id, status: "failed" });
+          continue;
+        }
+        if (
+          authorization.status === "CAPTURED" ||
+          authorization.status === "PARTIALLY_CAPTURED"
+        ) {
+          // Keep the refreshed claim so releaseDue cannot issue a new capture
+          // while PayPal's order readback is still incomplete.
+          results.push({
+            paymentId: payment.id,
+            status: "held",
+            error: "CAPTURE_RECOVERY_PENDING",
+          });
+          continue;
+        }
+
+        await this.dependencies.payments.clearActionClaim(payment.id, "release");
+        results.push({ paymentId: payment.id, status: "held" });
+      } catch (error) {
+        // Retain the refreshed claim: inconclusive PayPal reads must not permit
+        // releaseDue to submit another capture attempt.
+        results.push({
+          paymentId: payment.id,
+          status: "held",
+          error: this.safeErrorCode(error),
         });
       }
     }
@@ -581,9 +815,12 @@ export class PaymentOrchestrator {
         payment.capture_id,
       );
       if (refund.status !== "COMPLETED") {
-        throw new PayPalProviderError("REFUND_NOT_COMPLETED", "refundCapture");
+        throw new OrchestratorError(
+          "REFUND_NOT_COMPLETED",
+          "PayPal has not confirmed the full refund.",
+        );
       }
-      return await this.dependencies.payments.transition({
+      const refunded = await this.dependencies.payments.transition({
         paymentId: payment.id,
         expectedStatus: "captured",
         nextStatus: "refunded",
@@ -593,6 +830,8 @@ export class PaymentOrchestrator {
         detail: { refund_id: refund.refundId },
         claimAction: "refund",
       });
+      this.notify({ type: "refunded", payment: refunded });
+      return refunded;
     } catch (error) {
       await this.dependencies.payments.clearActionClaim(payment.id, "refund");
       throw this.toOrchestratorError(error);
@@ -613,11 +852,22 @@ export class PaymentOrchestrator {
   }
 
   async listMandates(): Promise<Mandate[]> {
-    return this.dependencies.mandates.list();
+    const mandates = await this.dependencies.mandates.list();
+    if (
+      mandates.some(
+        (mandate) => !verifyMandateSignature(mandate, this.signingSecret),
+      )
+    ) {
+      throw new OrchestratorError(
+        "MANDATE_SIGNATURE_INVALID",
+        "A stored mandate signature is invalid.",
+      );
+    }
+    return mandates;
   }
 
   private async persistRejection(
-    input: ReturnType<typeof reservePaymentInputSchema.parse>,
+    input: ReservePaymentInput,
     decision: ReturnType<typeof evaluate>,
     reason: string,
     at: string,
@@ -625,13 +875,8 @@ export class PaymentOrchestrator {
     const payment = await this.dependencies.payments.createRejected(
       input,
       reason,
-      { phase: "preflight", failed_rules: failedRules(decision).join(",") },
-    );
-    await this.dependencies.decisions.append(
-      payment.id,
       decision,
       at,
-      "preflight",
     );
     return payment;
   }
@@ -660,6 +905,12 @@ export class PaymentOrchestrator {
     if (!mandate) {
       throw new OrchestratorError("MANDATE_NOT_FOUND", "Mandate not found.");
     }
+    if (!verifyMandateSignature(mandate, this.signingSecret)) {
+      throw new OrchestratorError(
+        "MANDATE_SIGNATURE_INVALID",
+        "The stored mandate signature is invalid.",
+      );
+    }
     return mandate;
   }
 
@@ -669,7 +920,10 @@ export class PaymentOrchestrator {
       capture.amountCents !== payment.amount ||
       capture.currency !== payment.currency
     ) {
-      throw new PayPalProviderError("CAPTURE_NOT_COMPLETED", "captureAuthorization");
+      throw new OrchestratorError(
+        "CAPTURE_NOT_COMPLETED",
+        "PayPal has not confirmed the full capture.",
+      );
     }
   }
 
@@ -699,6 +953,18 @@ export class PaymentOrchestrator {
     return error instanceof OrchestratorError
       ? error.code
       : safeFailureCode(error);
+  }
+
+  private notify(notification: PaymentNotification): void {
+    if (!this.dependencies.notifier) {
+      return;
+    }
+    void this.dependencies.notifier.notify(notification).catch(() => {
+      console.error("REWIND_NOTIFIER_ERROR", {
+        code: "DELIVERY_FAILED",
+        type: notification.type,
+      });
+    });
   }
 
   private toOrchestratorError(error: unknown): OrchestratorError {
