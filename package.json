@@ -9,14 +9,17 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "@langchain/openrouter": "^0.4.24",
     "@paypal/agent-toolkit": "^1.11.0",
+    "langchain": "^1.6.4",
     "next": "16.4.6",
     "react": "19.3.0",
-    "react-dom": "19.3.0"
+    "react-dom": "19.3.0",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@tailwindcss/turbopack": "4.3.3",
-    "@types/node": "^20",
+    "@types/node": "^26.6.6",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
