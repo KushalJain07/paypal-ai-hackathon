@@ -145,10 +145,13 @@ function normalizeMandate(input: unknown): Mandate {
 }
 
 function normalizeDecision(input: unknown): RuleResult[] {
-  const record = object(input);
-  const list = Array.isArray(record.results)
+  if (input === undefined || input === null) return [];
+  const record = Array.isArray(input) ? null : object(input);
+  const list = Array.isArray(input)
+    ? input
+    : Array.isArray(record?.results)
     ? record.results
-    : Array.isArray(record.decisions)
+    : Array.isArray(record?.decisions)
     ? record.decisions
     : [];
   const byRule = new Map<string, RuleResult>();
@@ -158,7 +161,7 @@ function normalizeDecision(input: unknown): RuleResult[] {
     if (!ruleOrder.includes(rule)) continue;
     byRule.set(rule, {
       rule,
-      phase: string(item.phase, string(record.phase, "preflight")) === "authorized"
+      phase: string(item.phase, string(record?.phase, "preflight")) === "authorized"
         ? "authorized"
         : "preflight",
       passed: item.passed === true,

@@ -8,7 +8,7 @@
     "start": "next start",
     "lint": "eslint",
     "typecheck": "tsc --noEmit",
-    "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test tests/domain/*.test.ts tests/persistence/*.test.ts tests/paypal/*.test.ts tests/orchestrator/*.test.ts tests/api/*.test.ts tests/notifications/*.test.ts tests/worker/*.test.ts",
+    "test": "node --experimental-transform-types --disable-warning=ExperimentalWarning --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test tests/domain/*.test.ts tests/persistence/*.test.ts tests/paypal/*.test.ts tests/orchestrator/*.test.ts tests/api/*.test.ts tests/notifications/*.test.ts tests/worker/*.test.ts",
     "paypal:smoke": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/paypal-smoke.ts",
     "kernel:approve": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/kernel-approve.ts",
     "demo:agent": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/demo-agent.ts",
