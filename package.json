@@ -6,11 +6,16 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "typecheck": "tsc --noEmit",
+    "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test tests/domain/*.test.ts tests/persistence/*.test.ts tests/paypal/*.test.ts",
+    "paypal:smoke": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/paypal-smoke.ts",
+    "supabase:smoke": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/supabase-smoke.ts"
   },
   "dependencies": {
     "@langchain/openrouter": "^0.4.24",
     "@paypal/agent-toolkit": "^1.11.0",
+    "@supabase/supabase-js": "^2.119.0",
     "install": "^0.13.0",
     "langchain": "^1.6.4",
     "next": "16.4.6",
